@@ -15,18 +15,19 @@
 (define-constant ERR-TIME-LOCK-ACTIVE (err u111))
 (define-constant ERR-INVALID-AMOUNT (err u112))
 (define-constant ERR-REPUTATION-TOO-LOW (err u113))
+(define-constant ERR-PROPOSAL-ALREADY-EXECUTED (err u114))
 
 ;; Constants
 (define-constant CONTRACT-OWNER tx-sender)
 (define-constant MICRO-GRANT-THRESHOLD u1000)
+(define-constant MEGA-GRANT-THRESHOLD u50000)
 (define-constant SUPERMAJORITY-THRESHOLD u75)
 (define-constant TIME-LOCK-PERIOD u144) ;; blocks
 (define-constant MAX-VOTING-PERIOD u1008) ;; blocks
-(define-constant QUADRATIC-SCALING-FACTOR u10000)
 
 ;; Data variables
 (define-data-var proposal-counter uint u0)
-(define-data-var total-treasury-balance uint u0)
+(define-data-var total-treasury-balance uint u1000000) ;; Initial treasury
 (define-data-var oracle-address principal CONTRACT-OWNER)
 (define-data-var minimum-reputation-score uint u10)
 (define-data-var ai-predictor-enabled bool true)
@@ -113,17 +114,132 @@
     }
 )
 
-(define-map cross-chain-resources
-    { proposal-id: uint, chain-id: (string-ascii 20) }
-    {
-        contributed-amount: uint,
-        chain-address: (string-ascii 100),
-        verified: bool
-    }
-)
-
 ;; Token balance tracking
 (define-map token-balances { user: principal } { balance: uint })
+
+;; Helper functions
+(define-private (determine-proposal-type (amount uint))
+    (if (<= amount MICRO-GRANT-THRESHOLD)
+        PROPOSAL-TYPE-MICRO
+        (if (<= amount MEGA-GRANT-THRESHOLD)
+            PROPOSAL-TYPE-STANDARD
+            PROPOSAL-TYPE-MEGA
+        )
+    )
+)
+
+(define-private (calculate-voting-period (proposal-type uint))
+    (if (is-eq proposal-type PROPOSAL-TYPE-MICRO)
+        u72  ;; ~12 hours
+        (if (is-eq proposal-type PROPOSAL-TYPE-STANDARD)
+            u432 ;; ~3 days
+            u1008 ;; ~7 days
+        )
+    )
+)
+
+(define-private (calculate-quadratic-voting-power (tokens uint))
+    ;; Simple quadratic scaling using integer approximation
+    ;; For quadratic voting: voting_power = sqrt(tokens)
+    (if (<= tokens u1)
+        u1
+        (if (<= tokens u4)
+            u2
+            (if (<= tokens u9)
+                u3
+                (if (<= tokens u16)
+                    u4
+                    (if (<= tokens u25)
+                        u5
+                        (if (<= tokens u36)
+                            u6
+                            (if (<= tokens u49)
+                                u7
+                                (if (<= tokens u64)
+                                    u8
+                                    (if (<= tokens u81)
+                                        u9
+                                        (if (<= tokens u100)
+                                            u10
+                                            ;; For larger amounts, use simplified scaling
+                                            (+ u10 (/ (- tokens u100) u20))
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+        )
+    )
+)
+
+(define-private (calculate-ai-feasibility-score (amount uint) (category (string-ascii 50)))
+    ;; Simplified AI scoring based on amount and category
+    (let ((base-score (if (<= amount u10000) u80 u60)))
+        (if (is-eq category "development")
+            (+ base-score u10)
+            (if (is-eq category "community")
+                (+ base-score u5)
+                base-score
+            )
+        )
+    )
+)
+
+(define-private (get-conviction-bonus (user principal) (category (string-ascii 50)))
+    (let ((conviction-data (map-get? conviction-voting { user: user, category: category })))
+        (if (is-some conviction-data)
+            (let ((data (unwrap-panic conviction-data)))
+                (/ (get accumulated-power data) u10)
+            )
+            u0
+        )
+    )
+)
+
+(define-private (update-conviction-voting (user principal) (category (string-ascii 50)))
+    (let ((current-data (default-to 
+                            { accumulated-power: u0, last-activity-block: u0, consistency-score: u0 }
+                            (map-get? conviction-voting { user: user, category: category }))))
+        (map-set conviction-voting { user: user, category: category }
+            {
+                accumulated-power: (+ (get accumulated-power current-data) u1),
+                last-activity-block: block-height,
+                consistency-score: (+ (get consistency-score current-data) u1)
+            }
+        )
+    )
+)
+
+;; Read-only functions
+(define-read-only (get-user-reputation (user principal))
+    (default-to 
+        { reputation-score: u50, successful-votes: u0, total-votes: u0, conviction-power: u0, category-expertise: "" }
+        (map-get? user-reputation { user: user })
+    )
+)
+
+(define-read-only (get-proposal (proposal-id uint))
+    (map-get? proposals { proposal-id: proposal-id })
+)
+
+(define-read-only (get-user-vote (proposal-id uint) (voter principal))
+    (map-get? user-votes { proposal-id: proposal-id, voter: voter })
+)
+
+(define-read-only (get-token-balance (user principal))
+    (default-to u0 (get balance (map-get? token-balances { user: user })))
+)
+
+(define-read-only (get-treasury-balance)
+    (var-get total-treasury-balance)
+)
+
+(define-read-only (get-proposal-count)
+    (var-get proposal-counter)
+)
 
 ;; Administrative functions
 (define-public (set-oracle-address (new-oracle principal))
@@ -150,6 +266,27 @@
     )
 )
 
+(define-public (mint-tokens (recipient principal) (amount uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (let ((current-balance (get-token-balance recipient)))
+            (map-set token-balances { user: recipient }
+                { balance: (+ current-balance amount) }
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (add-to-treasury (amount uint))
+    (begin
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (var-set total-treasury-balance (+ (var-get total-treasury-balance) amount))
+        (ok true)
+    )
+)
+
 ;; Core proposal creation
 (define-public (create-proposal 
     (title (string-ascii 100))
@@ -167,6 +304,7 @@
     )
         (asserts! (>= (get reputation-score user-rep) (var-get minimum-reputation-score)) ERR-REPUTATION-TOO-LOW)
         (asserts! (> amount-requested u0) ERR-INVALID-AMOUNT)
+        (asserts! (<= amount-requested (var-get total-treasury-balance)) ERR-INSUFFICIENT-BALANCE)
         
         (map-set proposals { proposal-id: proposal-id }
             {
@@ -211,7 +349,7 @@
     (let (
         (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
         (user-rep (get-user-reputation tx-sender))
-        (user-balance (default-to u0 (get balance (map-get? token-balances { user: tx-sender }))))
+        (user-balance (get-token-balance tx-sender))
         (quadratic-power (calculate-quadratic-voting-power tokens-committed))
         (conviction-bonus (get-conviction-bonus tx-sender (get category proposal)))
         (total-voting-power (+ quadratic-power conviction-bonus))
@@ -221,6 +359,7 @@
         (asserts! (>= user-balance tokens-committed) ERR-INSUFFICIENT-BALANCE)
         (asserts! (is-none (map-get? user-votes { proposal-id: proposal-id, voter: tx-sender })) ERR-ALREADY-VOTED)
         (asserts! (> total-voting-power u0) ERR-INSUFFICIENT-VOTING-POWER)
+        (asserts! (> tokens-committed u0) ERR-INVALID-AMOUNT)
         
         ;; Record vote
         (map-set user-votes { proposal-id: proposal-id, voter: tx-sender }
@@ -242,6 +381,16 @@
         
         ;; Update conviction voting
         (update-conviction-voting tx-sender (get category proposal))
+        
+        ;; Update user reputation
+        (let ((current-rep (get-user-reputation tx-sender)))
+            (map-set user-reputation { user: tx-sender }
+                (merge current-rep {
+                    total-votes: (+ (get total-votes current-rep) u1),
+                    conviction-power: (+ (get conviction-power current-rep) conviction-bonus)
+                })
+            )
+        )
         
         ;; Lock tokens
         (map-set token-balances { user: tx-sender }
@@ -275,9 +424,113 @@
             )
         )
         
+        ;; Check treasury balance
+        (asserts! (>= (var-get total-treasury-balance) (get amount-requested proposal)) ERR-INSUFFICIENT-BALANCE)
+        
         ;; Update proposal status
         (map-set proposals { proposal-id: proposal-id }
             (merge proposal { 
                 status: STATUS-EXECUTED,
                 execution-block: block-height 
             })
+        )
+        
+        ;; Transfer funds from treasury
+        (var-set total-treasury-balance (- (var-get total-treasury-balance) (get amount-requested proposal)))
+        
+        ;; Credit beneficiary
+        (let ((beneficiary-balance (get-token-balance (get beneficiary escrow))))
+            (map-set token-balances { user: (get beneficiary escrow) }
+                { balance: (+ beneficiary-balance (get amount-requested proposal)) }
+            )
+        )
+        
+        (ok true)
+    )
+)
+
+;; Milestone management
+(define-public (add-milestone 
+    (proposal-id uint)
+    (milestone-id uint)
+    (description (string-ascii 200))
+    (amount uint))
+    (let ((proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND)))
+        (asserts! (is-eq tx-sender (get proposer proposal)) ERR-NOT-AUTHORIZED)
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        
+        (map-set proposal-milestones { proposal-id: proposal-id, milestone-id: milestone-id }
+            {
+                description: description,
+                amount: amount,
+                completed: false,
+                verified-by-oracle: false,
+                completion-block: u0
+            }
+        )
+        
+        ;; Update escrow milestone count
+        (let ((escrow (unwrap! (map-get? escrow-accounts { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND)))
+            (map-set escrow-accounts { proposal-id: proposal-id }
+                (merge escrow { milestones-count: (+ (get milestones-count escrow) u1) })
+            )
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (complete-milestone 
+    (proposal-id uint)
+    (milestone-id uint))
+    (let (
+        (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+        (milestone (unwrap! (map-get? proposal-milestones { proposal-id: proposal-id, milestone-id: milestone-id }) ERR-MILESTONE-NOT-FOUND))
+    )
+        (asserts! (is-eq tx-sender (get proposer proposal)) ERR-NOT-AUTHORIZED)
+        (asserts! (not (get completed milestone)) ERR-MILESTONE-NOT-FOUND)
+        
+        (map-set proposal-milestones { proposal-id: proposal-id, milestone-id: milestone-id }
+            (merge milestone { 
+                completed: true,
+                completion-block: block-height 
+            })
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (verify-milestone 
+    (proposal-id uint)
+    (milestone-id uint))
+    (let ((milestone (unwrap! (map-get? proposal-milestones { proposal-id: proposal-id, milestone-id: milestone-id }) ERR-MILESTONE-NOT-FOUND)))
+        (asserts! (is-eq tx-sender (var-get oracle-address)) ERR-NOT-AUTHORIZED)
+        (asserts! (get completed milestone) ERR-MILESTONE-NOT-FOUND)
+        
+        (map-set proposal-milestones { proposal-id: proposal-id, milestone-id: milestone-id }
+            (merge milestone { verified-by-oracle: true })
+        )
+        
+        (ok true)
+    )
+)
+
+;; Utility functions for token management
+(define-public (unlock-voting-tokens (proposal-id uint))
+    (let (
+        (user-vote (unwrap! (map-get? user-votes { proposal-id: proposal-id, voter: tx-sender }) ERR-PROPOSAL-NOT-FOUND))
+        (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+        (current-balance (get-token-balance tx-sender))
+    )
+        ;; Can only unlock after voting period ends
+        (asserts! (> block-height (get voting-end-block proposal)) ERR-VOTING-PERIOD-ENDED)
+        
+        ;; Return locked tokens
+        (map-set token-balances { user: tx-sender }
+            { balance: (+ current-balance (get tokens-committed user-vote)) }
+        )
+        
+        (ok true)
+    )
+)
